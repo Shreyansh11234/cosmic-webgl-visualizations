@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Stellar Death</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    cursor: grab;
+  }
+  canvas.dragging { cursor: grabbing; }
+
+  .vignette {
+    position: fixed; inset: 0;
+    pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 35%, rgba(0,0,0,0.6) 100%);
+  }
+
+  .hud {
+    position: fixed; inset: 0;
+    pointer-events: none;
+    user-select: none;
+  }
+  .eyebrow {
+    position: absolute;
+    top: 28px; left: 28px;
+    font-family: "SFMono-Regular", Consolas, Menlo, "Courier New", monospace;
+    font-size: 10.5px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: rgba(255, 200, 170, 0.55);
+  }
+  .eyebrow .sub {
+    display: block;
+    margin-top: 6px;
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    color: rgba(255, 200, 170, 0.3);
+    text-transform: none;
+  }
+
+  .readout {
+    position: absolute;
+    bottom: 28px; left: 28px;
+    font-family: "SFMono-Regular", Consolas, Menlo, "Courier New", monospace;
+    font-size: 11px;
+    line-height: 1.9;
+    letter-spacing: 0.5px;
+    color: rgba(255, 200, 170, 0.65);
+  }
+  .readout .row { display: flex; gap: 14px; }
+  .readout .label { color: rgba(255,255,255,0.28); width: 78px; display: inline-block; }
+
+  .hint {
+    position: absolute;
+    bottom: 28px; right: 28px;
+    font-size: 10.5px;
+    letter-spacing: 1px;
+    color: rgba(255,255,255,0.3);
+    transition: opacity 1.2s ease;
+  }
+  .hint.faded { opacity: 0; }
+
+  .fallback {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: rgba(255,255,255,0.6);
+    font-size: 13px;
+    text-align: center;
+    padding: 24px;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="gl"></canvas>
+<div class="vignette"></div>
+
+<div class="hud">
+  <div class="eyebrow">
+    Stellar Death — Type II Supernova
+    <span class="sub">core collapse · shockwave · neutron star remnant (looped)</span>
+  </div>
+
+  <div class="readout">
+    <div class="row"><span class="label">stage</span><span id="stage-val">—</span></div>
+    <div class="row"><span class="label">cycle</span><span id="cycle-val">00:00 / 00:26</span></div>
+  </div>
+
+  <div class="hint" id="hint">drag to orbit &nbsp;·&nbsp; scroll to zoom</div>
+</div>
+
+<script>
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl2', { antialias: false, powerPreference: 'high-performance' });
+
+if (!gl) {
+  document.body.innerHTML = '<div class="fallback">WebGL2 isn\'t available in this browser, so this can\'t render here.</div>';
+  throw new Error('WebGL2 unsupported');
+}
+
+const VERT_SRC = `#version 300 es
+void main() {
+  vec2 p = vec2((gl_VertexID == 2) ? 3.0 : -1.0, (gl_VertexID == 1) ? 3.0 : -1.0);
+  gl_Position = vec4(p, 0.0, 1.0);
+}`;
+
+const FRAG_SRC = `#version 300 es
+precision highp float;
+out vec4 fragColor;
+
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform vec3 u_camPos;
+uniform vec3 u_camRight;
+uniform vec3 u_camUp;
+uniform vec3 u_camForward;
+uniform float u_focal;
+uniform float u_flashDamp;
+
+const float CYCLE = 26.0;
+
+float hash13(vec3 p3) {
+  p3 = fract(p3 * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+float noise3(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float n000 = hash13(i + vec3(0.0,0.0,0.0));
+  float n100 = hash13(i + vec3(1.0,0.0,0.0));
+  float n010 = hash13(i + vec3(0.0,1.0,0.0));
+  float n110 = hash13(i + vec3(1.0,1.0,0.0));
+  float n001 = hash13(i + vec3(0.0,0.0,1.0));
+  float n101 = hash13(i + vec3(1.0,0.0,1.0));
+  float n011 = hash13(i + vec3(0.0,1.0,1.0));
+  float n111 = hash13(i + vec3(1.0,1.0,1.0));
+  float nx00 = mix(n000, n100, f.x);
+  float nx10 = mix(n010, n110, f.x);
+  float nx01 = mix(n001, n101, f.x);
+  float nx11 = mix(n011, n111, f.x);
+  float nxy0 = mix(nx00, nx10, f.y);
+  float nxy1 = mix(nx01, nx11, f.y);
+  return mix(nxy0, nxy1, f.z);
+}
+
+float fbm(vec3 p) {
+  float sum = 0.0, amp = 0.5;
+  for (int i = 0; i < 5; i++) {
+    sum += amp * noise3(p);
+    p *= 2.02;
+    amp *= 0.5;
+  }
+  return sum;
+}
+
+vec3 starfield(vec3 d) {
+  vec3 col = vec3(0.0);
+  for (int i = 1; i <= 3; i++) {
+    float scale = float(i) * 85.0;
+    vec3 p = d * scale;
+    vec3 cell = floor(p);
+    float h = hash13(cell);
+    float star = smoothstep(0.994, 1.0, h);
+    float tw = 0.6 + 0.4 * sin(u_time * 1.2 + h * 130.0);
+    col += vec3(star * tw) / float(i);
+  }
+  return col * vec3(0.85, 0.9, 1.0);
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
+  vec3 rd = normalize(u_camRight * uv.x + u_camUp * uv.y + u_camForward * u_focal);
+  vec3 ro = u_camPos;
+
+  float ct = mod(u_time, CYCLE);
+
+  // ---- lifecycle parameters, blended sequentially over the cycle ----
+  float coreR = 2.6 + 0.18 * sin(ct * 0.9);
+  coreR = mix(coreR, 0.85, smoothstep(8.0, 9.6, ct));
+  coreR = mix(coreR, 0.30, smoothstep(10.6, 15.0, ct));
+
+  vec3 coreColor = vec3(1.0, 0.35, 0.12);
+  coreColor = mix(coreColor, vec3(0.88, 0.9, 1.0), smoothstep(8.0, 10.2, ct));
+  coreColor = mix(coreColor, vec3(0.6, 0.8, 1.0), smoothstep(10.6, 15.0, ct));
+
+  float coreBrightness = 1.0;
+  coreBrightness = mix(coreBrightness, 2.0, smoothstep(8.0, 10.0, ct));
+  coreBrightness = mix(coreBrightness, 3.4, smoothstep(10.6, 15.0, ct));
+
+  float flashRise = smoothstep(9.8, 10.15, ct);
+  float flashFall = 1.0 - smoothstep(10.15, 11.4, ct);
+  float flashAmount = flashRise * flashFall * 5.0 * u_flashDamp;
+
+  float shellSpread = smoothstep(10.2, 24.0, ct);
+  float shellR = 0.9 + 16.5 * sqrt(max(shellSpread, 0.0));
+  float shellWindowOn = smoothstep(10.1, 10.6, ct);
+  float shellIntensity = shellWindowOn * mix(1.0, 0.08, smoothstep(10.6, 22.0, ct));
+
+  float ejectaActive = smoothstep(10.3, 12.5, ct);
+  float pulsarActive = smoothstep(11.0, 14.5, ct);
+
+  float fadeIn = smoothstep(0.0, 1.6, ct);
+  float fadeOut = 1.0 - smoothstep(24.0, 26.0, ct);
+  float sceneFade = fadeIn * fadeOut;
+
+  // ---- analytic core sphere intersection ----
+  float b = dot(ro, rd);
+  float c = dot(ro, ro) - coreR * coreR;
+  float disc = b * b - c;
+  bool hitCore = false;
+  float tCore = 1e9;
+  if (disc > 0.0) {
+    float sq = sqrt(disc);
+    float t0 = -b - sq;
+    if (t0 > 0.0) { hitCore = true; tCore = t0; }
+  }
+
+  // ---- march through space for shockwave shell + ejecta ----
+  vec3 bgAccum = vec3(0.0);
+  float bgAlpha = 0.0;
+  float tMax = hitCore ? tCore : 40.0;
+  float dt = 0.18;
+  float prevR = length(ro);
+  const int STEPS = 230;
+
+  for (int i = 0; i < STEPS; i++) {
+    float tNow = float(i) * dt;
+    if (tNow > tMax) break;
+
+    vec3 p = ro + rd * tNow;
+    float rNow = length(p);
+
+    if (shellIntensity > 0.001) {
+      float prevDiff = prevR - shellR;
+      float newDiff = rNow - shellR;
+      if (sign(prevDiff) != sign(newDiff)) {
+        vec3 shellColor = vec3(0.62, 0.82, 1.0);
+        float a = shellIntensity * 0.85;
+        bgAccum += shellColor * a * (1.0 - bgAlpha);
+        bgAlpha += a * (1.0 - bgAlpha);
+      }
+    }
+
+    if (ejectaActive > 0.001 && rNow > coreR * 1.1 && rNow < shellR) {
+      vec3 cell = floor(p * 1.6);
+      float seed = hash13(cell);
+      if (seed > 0.975) {
+        float radialPos = rNow / max(shellR, 0.001);
+        float density = ejectaActive * (1.0 - radialPos) * 0.6;
+        vec3 ecol = mix(vec3(1.0, 0.42, 0.15), vec3(1.0, 0.82, 0.55), seed);
+        float a = density * 0.1;
+        bgAccum += ecol * a * (1.0 - bgAlpha);
+        bgAlpha += a * (1.0 - bgAlpha);
+      }
+    }
+
+    prevR = rNow;
+    if (bgAlpha > 0.97) break;
+  }
+
+  // ---- corona / rim glow ----
+  float tClosest = max(dot(-ro, rd), 0.0);
+  vec3 closestPt = ro + rd * tClosest;
+  float dClosest = length(closestPt);
+  float coronaFalloff = exp(-max(dClosest - coreR, 0.0) * 0.5);
+  vec3 coronaCol = mix(vec3(1.0, 0.5, 0.22), vec3(0.65, 0.8, 1.0), smoothstep(8.0, 10.5, ct));
+  vec3 corona = coronaCol * coronaFalloff * coreBrightness * 0.5;
+
+  // ---- final composite ----
+  vec3 finalColor = vec3(0.0);
+
+  if (hitCore) {
+    vec3 hitP = ro + rd * tCore;
+    vec3 N = normalize(hitP);
+    float limb = pow(max(dot(N, -rd), 0.0), 0.6);
+
+    float turb = fbm(N * 3.2 + vec3(0.0, 0.0, u_time * 0.15));
+    turb += 0.5 * fbm(N * 7.0 - vec3(u_time * 0.05, 0.0, 0.0));
+    turb *= 0.55;
+
+    vec3 surfaceCol = coreColor * (0.55 + 0.9 * turb) * coreBrightness * (0.5 + 0.7 * limb);
+
+    if (pulsarActive > 0.001) {
+      float spinAngle = u_time * 5.5;
+      float beamAngle = atan(N.z, N.x) - spinAngle;
+      float lobeA = pow(max(cos(beamAngle), 0.0), 40.0);
+      float lobeB = pow(max(cos(beamAngle + 3.14159265), 0.0), 40.0);
+      surfaceCol += vec3(0.7, 0.85, 1.0) * (lobeA + lobeB) * pulsarActive * 3.0;
+    }
+
+    finalColor += surfaceCol * sceneFade;
+  } else {
+    finalColor += starfield(normalize(rd)) * 0.55;
+  }
+
+  finalColor += corona * sceneFade;
+  finalColor += bgAccum * sceneFade;
+  finalColor += vec3(1.0, 0.95, 0.85) * flashAmount * sceneFade;
+
+  finalColor = finalColor / (finalColor + vec3(1.0));
+  finalColor = pow(finalColor, vec3(0.85));
+
+  fragColor = vec4(finalColor, 1.0);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+const program = gl.createProgram();
+gl.attachShader(program, compile(gl.VERTEX_SHADER, VERT_SRC));
+gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FRAG_SRC));
+gl.linkProgram(program);
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(program));
+gl.useProgram(program);
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+
+const uniforms = {};
+['u_resolution','u_time','u_camPos','u_camRight','u_camUp','u_camForward','u_focal','u_flashDamp'].forEach(name => {
+  uniforms[name] = gl.getUniformLocation(program, name);
+});
+
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const timeScale = reducedMotion ? 0.5 : 1.0;
+const flashDamp = reducedMotion ? 0.4 : 1.0;
+
+let theta = 0.75;
+let phi = 1.2;
+let radius = 15.0;
+const target = [0, 0, 0];
+const minRadius = 4.5, maxRadius = 42.0;
+const minPhi = 0.25, maxPhi = Math.PI - 0.25;
+const autoRotateSpeed = reducedMotion ? 0.0 : 0.02;
+
+let dragging = false;
+let lastX = 0, lastY = 0;
+const hint = document.getElementById('hint');
+let hinted = false;
+function markInteracted() {
+  if (!hinted) { hint.classList.add('faded'); hinted = true; }
+}
+
+canvas.addEventListener('pointerdown', e => {
+  dragging = true;
+  canvas.classList.add('dragging');
+  lastX = e.clientX; lastY = e.clientY;
+  markInteracted();
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const dx = e.clientX - lastX;
+  const dy = e.clientY - lastY;
+  theta -= dx * 0.0052;
+  phi -= dy * 0.0052;
+  phi = Math.max(minPhi, Math.min(maxPhi, phi));
+  lastX = e.clientX; lastY = e.clientY;
+});
+window.addEventListener('pointerup', () => {
+  dragging = false;
+  canvas.classList.remove('dragging');
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  radius *= (1 + e.deltaY * 0.0011);
+  radius = Math.max(minRadius, Math.min(maxRadius, radius));
+  markInteracted();
+}, { passive: false });
+
+function resize() {
+  const maxDim = 1700;
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+  let w = window.innerWidth * dpr;
+  let h = window.innerHeight * dpr;
+  const scale = Math.min(1, maxDim / Math.max(w, h));
+  w = Math.floor(w * scale);
+  h = Math.floor(h * scale);
+  canvas.width = w;
+  canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---- stage readout ----
+const stageEl = document.getElementById('stage-val');
+const cycleEl = document.getElementById('cycle-val');
+const CYCLE = 26.0;
+function stageLabel(ct) {
+  if (ct < 8.0) return 'Red giant — helium shell burning';
+  if (ct < 10.15) return 'Core collapse';
+  if (ct < 10.7) return 'Supernova';
+  if (ct < 24.0) return 'Expanding remnant — neutron star';
+  return 'Remnant dissipating';
+}
+function fmtTime(s) {
+  const m = Math.floor(s / 60).toString().padStart(2, '0');
+  const sec = Math.floor(s % 60).toString().padStart(2, '0');
+  return m + ':' + sec;
+}
+
+let startTime = performance.now();
+let lastReadoutUpdate = 0;
+
+function frame(now) {
+  const elapsed = (now - startTime) / 1000;
+  const simTime = elapsed * timeScale;
+
+  if (!dragging) theta += autoRotateSpeed * 0.016;
+
+  const camPos = [
+    target[0] + radius * Math.sin(phi) * Math.cos(theta),
+    target[1] + radius * Math.cos(phi),
+    target[2] + radius * Math.sin(phi) * Math.sin(theta)
+  ];
+
+  const fx = target[0] - camPos[0], fy = target[1] - camPos[1], fz = target[2] - camPos[2];
+  const flen = Math.hypot(fx, fy, fz) || 1;
+  const fwd = [fx / flen, fy / flen, fz / flen];
+
+  const upW = [0, 1, 0];
+  let rx = fwd[1]*upW[2] - fwd[2]*upW[1];
+  let ry = fwd[2]*upW[0] - fwd[0]*upW[2];
+  let rz = fwd[0]*upW[1] - fwd[1]*upW[0];
+  const rlen = Math.hypot(rx, ry, rz) || 1;
+  rx/=rlen; ry/=rlen; rz/=rlen;
+
+  const ux = ry*fwd[2] - rz*fwd[1];
+  const uy = rz*fwd[0] - rx*fwd[2];
+  const uz = rx*fwd[1] - ry*fwd[0];
+
+  gl.uniform2f(uniforms.u_resolution, canvas.width, canvas.height);
+  gl.uniform1f(uniforms.u_time, simTime);
+  gl.uniform1f(uniforms.u_flashDamp, flashDamp);
+  gl.uniform3f(uniforms.u_camPos, camPos[0], camPos[1], camPos[2]);
+  gl.uniform3f(uniforms.u_camRight, rx, ry, rz);
+  gl.uniform3f(uniforms.u_camUp, ux, uy, uz);
+  gl.uniform3f(uniforms.u_camForward, fwd[0], fwd[1], fwd[2]);
+  gl.uniform1f(uniforms.u_focal, 1.4);
+
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  if (now - lastReadoutUpdate > 150) {
+    lastReadoutUpdate = now;
+    const ct = simTime % CYCLE;
+    stageEl.textContent = stageLabel(ct);
+    cycleEl.textContent = fmtTime(ct) + ' / ' + fmtTime(CYCLE);
+  }
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+
+</body>
+</html>

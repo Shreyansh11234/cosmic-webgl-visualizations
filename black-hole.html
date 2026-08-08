@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Event Horizon</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    cursor: grab;
+  }
+  canvas.dragging { cursor: grabbing; }
+
+  .vignette {
+    position: fixed; inset: 0;
+    pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 40%, rgba(0,0,0,0.55) 100%);
+  }
+
+  .hud {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    color: rgba(255,255,255,0.55);
+    user-select: none;
+  }
+
+  .eyebrow {
+    position: absolute;
+    top: 28px; left: 28px;
+    font-size: 10.5px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.45);
+  }
+  .eyebrow .sub {
+    display: block;
+    margin-top: 6px;
+    font-size: 10.5px;
+    letter-spacing: 1.5px;
+    color: rgba(255,255,255,0.25);
+    text-transform: none;
+  }
+
+  .readout {
+    position: absolute;
+    bottom: 28px; left: 28px;
+    font-family: "SFMono-Regular", Consolas, Menlo, "Courier New", monospace;
+    font-size: 11px;
+    line-height: 1.9;
+    letter-spacing: 0.5px;
+    color: rgba(255,200,150,0.65);
+  }
+  .readout .row { display: flex; gap: 14px; }
+  .readout .label { color: rgba(255,255,255,0.3); width: 96px; display: inline-block; }
+
+  .hint {
+    position: absolute;
+    bottom: 28px; right: 28px;
+    font-size: 10.5px;
+    letter-spacing: 1px;
+    color: rgba(255,255,255,0.35);
+    transition: opacity 1.2s ease;
+  }
+  .hint.faded { opacity: 0; }
+
+  .fallback {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: rgba(255,255,255,0.6);
+    font-size: 13px;
+    text-align: center;
+    padding: 24px;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="gl"></canvas>
+<div class="vignette"></div>
+
+<div class="hud">
+  <div class="eyebrow">
+    Sagittarius&nbsp;A*&nbsp;— schwarzschild model
+    <span class="sub">interactive gravitational lensing</span>
+  </div>
+
+  <div class="readout" id="readout">
+    <div class="row"><span class="label">orbit radius</span><span id="r-val">— Rs</span></div>
+    <div class="row"><span class="label">azimuth</span><span id="theta-val">—°</span></div>
+    <div class="row"><span class="label">inclination</span><span id="phi-val">—°</span></div>
+  </div>
+
+  <div class="hint" id="hint">drag to orbit &nbsp;·&nbsp; scroll to zoom</div>
+</div>
+
+<script>
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl2', { antialias: false, powerPreference: 'high-performance' });
+
+if (!gl) {
+  document.body.innerHTML = '<div class="fallback">WebGL2 isn\'t available in this browser, so the black hole can\'t render here.</div>';
+  throw new Error('WebGL2 unsupported');
+}
+
+const VERT_SRC = `#version 300 es
+void main() {
+  vec2 p = vec2((gl_VertexID == 2) ? 3.0 : -1.0, (gl_VertexID == 1) ? 3.0 : -1.0);
+  gl_Position = vec4(p, 0.0, 1.0);
+}`;
+
+const FRAG_SRC = `#version 300 es
+precision highp float;
+out vec4 fragColor;
+
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform vec3 u_camPos;
+uniform vec3 u_camRight;
+uniform vec3 u_camUp;
+uniform vec3 u_camForward;
+uniform float u_focal;
+uniform float u_motion;
+
+float hash13(vec3 p3) {
+  p3 = fract(p3 * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+vec3 starfield(vec3 d) {
+  vec3 col = vec3(0.0);
+  for (int i = 1; i <= 3; i++) {
+    float scale = float(i) * 90.0;
+    vec3 p = d * scale;
+    vec3 cell = floor(p);
+    float h = hash13(cell);
+    float star = smoothstep(0.9935, 1.0, h);
+    float tw = 0.7 + 0.3 * sin(u_time * 1.6 * u_motion + h * 120.0);
+    col += vec3(star * tw) / float(i);
+  }
+  float nebula = hash13(floor(d * 2.3)) * 0.045;
+  col += vec3(0.05, 0.035, 0.09) * nebula;
+  return col;
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
+
+  vec3 rd = normalize(u_camRight * uv.x + u_camUp * uv.y + u_camForward * u_focal);
+  vec3 ro = u_camPos;
+
+  vec3 pos = ro;
+  vec3 dir = rd;
+
+  vec3 accCol = vec3(0.0);
+  float accAlpha = 0.0;
+  bool captured = false;
+
+  float dt = 0.065;
+  const int STEPS = 190;
+
+  for (int i = 0; i < STEPS; i++) {
+    float r = length(pos);
+    if (r < 1.0) { captured = true; break; }
+    if (r > 45.0) { break; }
+
+    vec3 prevPos = pos;
+    float r3 = r * r * r;
+    vec3 accel = -1.55 * pos / r3;
+    dir += accel * dt;
+    pos += dir * dt;
+
+    if (sign(prevPos.y) != sign(pos.y) && accAlpha < 0.99) {
+      float denom = prevPos.y - pos.y;
+      float t = (abs(denom) > 1e-6) ? prevPos.y / denom : 0.0;
+      vec3 hitp = mix(prevPos, pos, t);
+      float rad = length(hitp.xz);
+
+      if (rad > 1.6 && rad < 9.0) {
+        float band = smoothstep(1.6, 2.3, rad) * smoothstep(9.0, 6.0, rad);
+        float temp = clamp(1.0 - (rad - 1.6) / (9.0 - 1.6), 0.0, 1.0);
+
+        vec3 hot  = vec3(1.0, 0.96, 0.78);
+        vec3 mid  = vec3(1.0, 0.55, 0.16);
+        vec3 cool = vec3(0.65, 0.14, 0.32);
+        vec3 dcol = mix(cool, mix(mid, hot, temp), temp);
+
+        float ang = atan(hitp.z, hitp.x);
+        float tSlice = floor(u_time * u_motion * 0.6);
+        float n1 = hash13(vec3(ang * 4.0, rad * 3.0, tSlice));
+        float n2 = hash13(vec3(ang * 9.0 + 3.1, rad * 6.0, tSlice - 1.0));
+        dcol *= (0.5 + 0.9 * mix(n1, n2, 0.5));
+
+        vec3 tangent = normalize(vec3(-hitp.z, 0.0, hitp.x));
+        float approach = dot(tangent, normalize(u_camPos - hitp));
+        dcol *= (0.5 + 0.9 * max(approach, 0.0));
+
+        float localAlpha = band * 0.55;
+        accCol += dcol * localAlpha * (1.0 - accAlpha);
+        accAlpha += localAlpha * (1.0 - accAlpha);
+      }
+    }
+  }
+
+  vec3 finalColor;
+  if (captured) {
+    finalColor = accCol;
+  } else {
+    vec3 bg = starfield(normalize(dir));
+    finalColor = accCol + bg * (1.0 - accAlpha);
+  }
+
+  finalColor = finalColor / (finalColor + vec3(1.0));
+  finalColor = pow(finalColor, vec3(0.85));
+
+  fragColor = vec4(finalColor, 1.0);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+
+const program = gl.createProgram();
+gl.attachShader(program, compile(gl.VERTEX_SHADER, VERT_SRC));
+gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FRAG_SRC));
+gl.linkProgram(program);
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+  console.error(gl.getProgramInfoLog(program));
+}
+gl.useProgram(program);
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+
+const uniforms = {};
+['u_resolution','u_time','u_camPos','u_camRight','u_camUp','u_camForward','u_focal','u_motion'].forEach(name => {
+  uniforms[name] = gl.getUniformLocation(program, name);
+});
+
+// ---- camera state ----
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+let theta = 0.9;
+let phi = 1.25;
+let radius = 12.0;
+const target = [0, 0, 0];
+const minRadius = 3.6, maxRadius = 30.0;
+const minPhi = 0.25, maxPhi = Math.PI - 0.25;
+let autoRotateSpeed = reducedMotion ? 0.0 : 0.028;
+const motionScale = reducedMotion ? 0.25 : 1.0;
+
+let dragging = false;
+let lastX = 0, lastY = 0;
+const hint = document.getElementById('hint');
+let hinted = false;
+
+function markInteracted() {
+  if (!hinted) { hint.classList.add('faded'); hinted = true; }
+}
+
+canvas.addEventListener('pointerdown', e => {
+  dragging = true;
+  canvas.classList.add('dragging');
+  lastX = e.clientX; lastY = e.clientY;
+  markInteracted();
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const dx = e.clientX - lastX;
+  const dy = e.clientY - lastY;
+  theta -= dx * 0.0052;
+  phi -= dy * 0.0052;
+  phi = Math.max(minPhi, Math.min(maxPhi, phi));
+  lastX = e.clientX; lastY = e.clientY;
+});
+window.addEventListener('pointerup', () => {
+  dragging = false;
+  canvas.classList.remove('dragging');
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  radius *= (1 + e.deltaY * 0.0011);
+  radius = Math.max(minRadius, Math.min(maxRadius, radius));
+  markInteracted();
+}, { passive: false });
+
+// ---- resize ----
+function resize() {
+  const maxDim = 1700;
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+  let w = window.innerWidth * dpr;
+  let h = window.innerHeight * dpr;
+  const scale = Math.min(1, maxDim / Math.max(w, h));
+  w = Math.floor(w * scale);
+  h = Math.floor(h * scale);
+  canvas.width = w;
+  canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---- readout ----
+const rVal = document.getElementById('r-val');
+const thetaVal = document.getElementById('theta-val');
+const phiVal = document.getElementById('phi-val');
+let lastReadoutUpdate = 0;
+
+function updateReadout(t) {
+  if (t - lastReadoutUpdate < 120) return;
+  lastReadoutUpdate = t;
+  rVal.textContent = radius.toFixed(2) + ' Rs';
+  thetaVal.textContent = ((theta % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) * 180 / Math.PI).toFixed(1) + '°';
+  phiVal.textContent = (phi * 180 / Math.PI).toFixed(1) + '°';
+}
+
+// ---- render loop ----
+let startTime = performance.now();
+
+function frame(now) {
+  const t = (now - startTime) / 1000;
+
+  if (!dragging) theta += autoRotateSpeed * 0.016;
+
+  const camPos = [
+    target[0] + radius * Math.sin(phi) * Math.cos(theta),
+    target[1] + radius * Math.cos(phi),
+    target[2] + radius * Math.sin(phi) * Math.sin(theta)
+  ];
+
+  const fx = target[0] - camPos[0], fy = target[1] - camPos[1], fz = target[2] - camPos[2];
+  const flen = Math.hypot(fx, fy, fz) || 1;
+  const fwd = [fx / flen, fy / flen, fz / flen];
+
+  const upW = [0, 1, 0];
+  let rx = fwd[1]*upW[2] - fwd[2]*upW[1];
+  let ry = fwd[2]*upW[0] - fwd[0]*upW[2];
+  let rz = fwd[0]*upW[1] - fwd[1]*upW[0];
+  const rlen = Math.hypot(rx, ry, rz) || 1;
+  rx/=rlen; ry/=rlen; rz/=rlen;
+
+  const ux = ry*fwd[2] - rz*fwd[1];
+  const uy = rz*fwd[0] - rx*fwd[2];
+  const uz = rx*fwd[1] - ry*fwd[0];
+
+  gl.uniform2f(uniforms.u_resolution, canvas.width, canvas.height);
+  gl.uniform1f(uniforms.u_time, t);
+  gl.uniform1f(uniforms.u_motion, motionScale);
+  gl.uniform3f(uniforms.u_camPos, camPos[0], camPos[1], camPos[2]);
+  gl.uniform3f(uniforms.u_camRight, rx, ry, rz);
+  gl.uniform3f(uniforms.u_camUp, ux, uy, uz);
+  gl.uniform3f(uniforms.u_camForward, fwd[0], fwd[1], fwd[2]);
+  gl.uniform1f(uniforms.u_focal, 1.4);
+
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  updateReadout(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+
+</body>
+</html>
